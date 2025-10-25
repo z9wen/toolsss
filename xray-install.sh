@@ -6691,39 +6691,50 @@ EOF
 
 # 脚本快捷方式
 aliasInstall() {
+    # 获取当前脚本的实际路径
+    local currentScript
+    currentScript="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    
+    # 确保目标目录存在
+    if [[ ! -d "/opt/xray-agent" ]]; then
+        mkdir -p /opt/xray-agent
+    fi
+    
+    # 复制当前脚本到标准位置
+    if [[ -f "$currentScript" ]]; then
+        cp "$currentScript" /opt/xray-agent/install.sh
+        chmod +x /opt/xray-agent/install.sh
+        echoContent green " ---> 脚本已复制到 /opt/xray-agent/install.sh"
+    else
+        echoContent red " ---> 无法找到当前脚本: $currentScript"
+        return 1
+    fi
 
-    if [[ -f "$HOME/install.sh" ]] && [[ -d "/opt/xray-agent" ]]; then
-        mv "$HOME/install.sh" /opt/xray-agent/install.sh
-        local xrayaType=
-        if [[ -d "/usr/bin/" ]]; then
-            # 先删除旧的软连接（如果存在）
-            if [[ -L "/usr/bin/xraya" ]]; then
-                rm -f /usr/bin/xraya
-            fi
-            # 创建新的软连接
-            if [[ ! -f "/usr/bin/xraya" ]]; then
-                ln -s /opt/xray-agent/install.sh /usr/bin/xraya
-                chmod 700 /usr/bin/xraya
-                xrayaType=true
-            fi
-
-            rm -rf "$HOME/install.sh"
-        elif [[ -d "/usr/sbin" ]]; then
-            # 先删除旧的软连接（如果存在）
-            if [[ -L "/usr/sbin/xraya" ]]; then
-                rm -f /usr/sbin/xraya
-            fi
-            # 创建新的软连接
-            if [[ ! -f "/usr/sbin/xraya" ]]; then
-                ln -s /opt/xray-agent/install.sh /usr/sbin/xraya
-                chmod 700 /usr/sbin/xraya
-                xrayaType=true
-            fi
-            rm -rf "$HOME/install.sh"
-        fi
-        if [[ "${xrayaType}" == "true" ]]; then
-            echoContent green "快捷方式创建成功，可执行[xraya]重新打开脚本"
-        fi
+    local xrayaType=false
+    
+    if [[ -d "/usr/bin/" ]]; then
+        # 先删除旧的软连接（如果存在）
+        rm -f /usr/bin/xraya
+        
+        # 创建新的软连接
+        ln -s /opt/xray-agent/install.sh /usr/bin/xraya
+        chmod 755 /usr/bin/xraya
+        xrayaType=true
+        
+    elif [[ -d "/usr/sbin" ]]; then
+        # 先删除旧的软连接（如果存在）
+        rm -f /usr/sbin/xraya
+        
+        # 创建新的软连接
+        ln -s /opt/xray-agent/install.sh /usr/sbin/xraya
+        chmod 755 /usr/sbin/xraya
+        xrayaType=true
+    fi
+    
+    if [[ "${xrayaType}" == "true" ]]; then
+        echoContent green "快捷方式创建成功，可执行[xraya]重新打开脚本"
+    else
+        echoContent red "快捷方式创建失败"
     fi
 }
 
