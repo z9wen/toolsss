@@ -6700,41 +6700,55 @@ aliasInstall() {
         mkdir -p /opt/xray-agent
     fi
     
-    # 复制当前脚本到标准位置
-    if [[ -f "$currentScript" ]]; then
-        cp "$currentScript" /opt/xray-agent/install.sh
-        chmod +x /opt/xray-agent/install.sh
+    # 只在首次安装或文件不存在时复制
+    local targetScript="/opt/xray-agent/install.sh"
+    local needCopy=false
+    
+    if [[ ! -f "$targetScript" ]]; then
+        needCopy=true
+    elif [[ "$currentScript" != "$targetScript" ]]; then
+        # 如果当前脚本不是目标位置，则需要复制（更新场景）
+        needCopy=true
+    fi
+    
+    if [[ "$needCopy" == "true" && -f "$currentScript" ]]; then
+        cp "$currentScript" "$targetScript"
+        chmod +x "$targetScript"
         echoContent green " ---> 脚本已复制到 /opt/xray-agent/install.sh"
-    else
+    elif [[ ! -f "$currentScript" ]]; then
         echoContent red " ---> 无法找到当前脚本: $currentScript"
         return 1
     fi
 
+    # 检查并创建软连接
     local xrayaType=false
+    local symlinkPath=""
     
     if [[ -d "/usr/bin/" ]]; then
-        # 先删除旧的软连接（如果存在）
-        rm -f /usr/bin/xraya
-        
-        # 创建新的软连接
-        ln -s /opt/xray-agent/install.sh /usr/bin/xraya
-        chmod 755 /usr/bin/xraya
-        xrayaType=true
-        
+        symlinkPath="/usr/bin/xraya"
     elif [[ -d "/usr/sbin" ]]; then
-        # 先删除旧的软连接（如果存在）
-        rm -f /usr/sbin/xraya
-        
-        # 创建新的软连接
-        ln -s /opt/xray-agent/install.sh /usr/sbin/xraya
-        chmod 755 /usr/sbin/xraya
-        xrayaType=true
+        symlinkPath="/usr/sbin/xraya"
     fi
     
-    if [[ "${xrayaType}" == "true" ]]; then
-        echoContent green "快捷方式创建成功，可执行[xraya]重新打开脚本"
-    else
-        echoContent red "快捷方式创建失败"
+    if [[ -n "$symlinkPath" ]]; then
+        # 检查软连接是否已存在且正确
+        if [[ -L "$symlinkPath" ]] && [[ "$(readlink "$symlinkPath")" == "$targetScript" ]]; then
+            # 软连接已存在且正确，无需重新创建
+            xrayaType=true
+        else
+            # 删除旧的软连接或文件
+            rm -f "$symlinkPath"
+            
+            # 创建新的软连接
+            ln -s "$targetScript" "$symlinkPath"
+            chmod 755 "$symlinkPath"
+            xrayaType=true
+            echoContent green " ---> 快捷方式创建成功，可执行[xraya]重新打开脚本"
+        fi
+    fi
+    
+    if [[ "${xrayaType}" == "false" ]]; then
+        echoContent red " ---> 快捷方式创建失败"
     fi
 }
 
