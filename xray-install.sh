@@ -265,6 +265,17 @@ initVar() {
     nginxStaticPath=/usr/share/nginx/html/
     # 自定义nginx配置路径标记
     customNginxConfigPath=
+    
+    # 读取已保存的 Nginx 配置路径
+    if [[ -f /opt/xray-agent/nginx_config_path ]]; then
+        nginxConfigPath=$(cat /opt/xray-agent/nginx_config_path)
+        customNginxConfigPath="true"
+    fi
+    
+    # 读取已保存的 Nginx 静态文件路径
+    if [[ -f /opt/xray-agent/nginx_static_path ]]; then
+        nginxStaticPath=$(cat /opt/xray-agent/nginx_static_path)
+    fi
 
     # 是否为预览版
     prereleaseStatus=false
@@ -331,6 +342,11 @@ initVar() {
 
     # 上次安装配置状态
     lastInstallationConfig=
+
+    # Native ACME 相关
+    nativeACMEEnabled=
+    nativeCertPath=
+    nativeKeyPath=
 
 }
 
@@ -697,15 +713,31 @@ allowPort() {
     if [[ -z "${type}" ]]; then
         type=tcp
     fi
-    # 如果防火墙启动状态则添加相应的开放端口
-    if dpkg -l | grep -q "^[[:space:]]*ii[[:space:]]\+ufw"; then
-        if ufw status | grep -q "Status: active"; then
+    
+    # 优先检查 UFW (通过 dpkg 检查是否安装)
+    if dpkg -l 2>/dev/null | grep -q "^[[:space:]]*ii[[:space:]]\+ufw"; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
             if ! ufw status | grep -q "$1/${type}"; then
                 sudo ufw allow "$1/${type}"
                 checkUFWAllowPort "$1"
             fi
         fi
-    elif systemctl status firewalld 2>/dev/null | grep -q "active (running)"; then
+        return
+    fi
+    
+    # 检查 UFW (通过 command 检查)
+    if command -v ufw &> /dev/null; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            if ! ufw status | grep -q "$1/${type}"; then
+                sudo ufw allow "$1/${type}"
+                checkUFWAllowPort "$1"
+            fi
+        fi
+        return
+    fi
+    
+    # 检查 firewalld
+    if systemctl status firewalld 2>/dev/null | grep -q "active (running)"; then
         local updateFirewalldStatus=
         if ! firewall-cmd --list-ports --permanent | grep -qw "$1/${type}"; then
             updateFirewalldStatus=true
@@ -720,22 +752,32 @@ allowPort() {
         if echo "${updateFirewalldStatus}" | grep -q "true"; then
             firewall-cmd --reload
         fi
-    elif rc-update show 2>/dev/null | grep -q ufw; then
-        if ufw status | grep -q "Status: active"; then
+        return
+    fi
+    
+    # 检查 Alpine Linux UFW
+    if rc-update show 2>/dev/null | grep -q ufw; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
             if ! ufw status | grep -q "$1/${type}"; then
                 sudo ufw allow "$1/${type}"
                 checkUFWAllowPort "$1"
             fi
         fi
-    elif dpkg -l | grep -q "^[[:space:]]*ii[[:space:]]\+netfilter-persistent" && systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
-        local updateFirewalldStatus=
-        if ! iptables -L | grep -q "$1/${type}(z9)"; then
-            updateFirewalldStatus=true
-            iptables -I INPUT -p ${type} --dport "$1" -m comment --comment "allow $1/${type}(z9)" -j ACCEPT
-        fi
+        return
+    fi
+    
+    # 最后检查 iptables (仅当没有其他防火墙时)
+    if dpkg -l 2>/dev/null | grep -q "^[[:space:]]*ii[[:space:]]\+netfilter-persistent"; then
+        if systemctl status netfilter-persistent 2>/dev/null | grep -q "active (exited)"; then
+            local updateFirewalldStatus=
+            if ! iptables -L | grep -q "$1/${type}(z9)"; then
+                updateFirewalldStatus=true
+                iptables -I INPUT -p ${type} --dport "$1" -m comment --comment "allow $1/${type}(z9)" -j ACCEPT
+            fi
 
-        if echo "${updateFirewalldStatus}" | grep -q "true"; then
-            netfilter-persistent save
+            if echo "${updateFirewalldStatus}" | grep -q "true"; then
+                netfilter-persistent save
+            fi
         fi
     fi
 }
@@ -1031,6 +1073,57 @@ cleanUp() {
     fi
 }
 
+# 检测 native ACME 客户端
+checkNativeACME() {
+    local nativeACMEInstalled=false
+    local nativeACMEType=""
+    
+    # 检测 certbot
+    if command -v certbot &> /dev/null; then
+        nativeACMEInstalled=true
+        nativeACMEType="certbot"
+        local certbotVersion=$(certbot --version 2>&1 | head -1)
+        echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
+        echoContent green "  版本: ${certbotVersion}"
+        
+        # 检查是否有现有证书
+        if [[ -d "/etc/letsencrypt/live" ]]; then
+            local certCount=$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d | wc -l)
+            if [[ ${certCount} -gt 0 ]]; then
+                echoContent yellow "  已有证书数量: ${certCount}"
+                echoContent skyBlue "\n可用证书域名:"
+                find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | nl
+            fi
+        fi
+        return 0
+    fi
+    
+    # 检测其他 ACME 客户端
+    if command -v lego &> /dev/null; then
+        nativeACMEInstalled=true
+        nativeACMEType="lego"
+        echoContent skyBlue "\n检测到 Native ACME 客户端: ${nativeACMEType}"
+        return 0
+    fi
+    
+    return 1
+}
+
+# 使用 native ACME 证书（初始化阶段的检查）
+useNativeACMECert() {
+    local useNative=false
+    
+    if checkNativeACME; then
+        echoContent skyBlue "\n=============================================================="
+        echoContent yellow "检测到系统已安装 Native ACME 客户端"
+        echoContent yellow "在安装过程中将提供使用现有证书的选项"
+        echoContent red "==============================================================\n"
+        # 不再在这里进行证书配置，留到证书安装步骤
+    fi
+    
+    echo "${useNative}"
+}
+
 # 检测 Nginx 环境并生成报告
 # 检测 Docker 中的 Nginx 容器
 checkDockerNginx() {
@@ -1051,7 +1144,9 @@ checkDockerNginx() {
             fi
         done
         echoContent skyBlue ""
+        return 0
     fi
+    return 1
 }
 
 # Nginx 环境检测
@@ -1175,7 +1270,10 @@ installTools() {
     fi
 
     if ! find /usr/bin /usr/sbin | grep -q -w netfilter-persistent; then
-        if [[ "${release}" != "centos" ]]; then
+        # 检查是否已安装 UFW
+        if dpkg -l 2>/dev/null | grep -q "^[[:space:]]*ii[[:space:]]\+ufw" || command -v ufw &> /dev/null; then
+            echoContent yellow " ---> 检测到 UFW 防火墙，跳过安装 iptables-persistent"
+        elif [[ "${release}" != "centos" ]]; then
             echoContent green " ---> 安装iptables"
             echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | sudo debconf-set-selections
             echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | sudo debconf-set-selections
@@ -1261,9 +1359,133 @@ installTools() {
     if echo "${selectCustomInstallType}" | grep -qwE ",7,|,8,|,7,8,"; then
         echoContent green " ---> 检测到无需依赖Nginx的服务，跳过安装"
     else
-        if ! find /usr/bin /usr/sbin | grep -q -w nginx; then
-            echoContent green " ---> 安装nginx"
-            installNginxTools
+        # 检查是否有 Docker Nginx 配置记录
+        local hasDockerNginxConfig=false
+        if [[ -f "/opt/xray-agent/nginx_config_path" ]]; then
+            hasDockerNginxConfig=true
+            savedNginxPath=$(cat /opt/xray-agent/nginx_config_path)
+            echoContent green " ---> 检测到之前配置的 Docker Nginx 路径: ${savedNginxPath}"
+        fi
+
+        # 检查 Docker Nginx (运行中)
+        if checkDockerNginx; then
+            echoContent green " ---> 检测到 Docker Nginx 运行中，跳过安装系统 Nginx"
+            echoContent yellow " ---> 将使用 Docker Nginx 配置"
+
+            # 询问是否设置 Docker Nginx 配置路径
+            read -r -p "是否设置 Docker Nginx 配置路径？[y/n] (默认: n):" setDockerNginxPath
+            if [[ "${setDockerNginxPath}" == "y" ]]; then
+                echoContent yellow "请输入 Docker Nginx 配置目录路径 (例: /path/to/nginx/conf.d/):"
+                read -r -p "配置路径:" dockerNginxPath
+                if [[ -n "${dockerNginxPath}" ]]; then
+                    # 确保路径以 / 结尾
+                    if [[ "${dockerNginxPath}" != */ ]]; then
+                        dockerNginxPath="${dockerNginxPath}/"
+                    fi
+                    nginxConfigPath="${dockerNginxPath}"
+                    customNginxConfigPath="true"
+
+                    # 保存配置路径到文件
+                    mkdir -p /opt/xray-agent
+                    echo "${nginxConfigPath}" > /opt/xray-agent/nginx_config_path
+
+                    echoContent green " ---> 已设置 Docker Nginx 配置路径: ${nginxConfigPath}"
+                fi
+
+                # 询问静态文件路径
+                echoContent yellow "\n请输入 Docker Nginx 静态文件目录路径 (容器内路径，例: /usr/share/nginx/html/ 或 /var/www/):"
+                read -r -p "静态文件路径:" dockerNginxStaticPath
+                if [[ -n "${dockerNginxStaticPath}" ]]; then
+                    # 确保路径以 / 结尾
+                    if [[ "${dockerNginxStaticPath}" != */ ]]; then
+                        dockerNginxStaticPath="${dockerNginxStaticPath}/"
+                    fi
+                    nginxStaticPath="${dockerNginxStaticPath}"
+
+                    # 保存静态文件路径到文件
+                    echo "${nginxStaticPath}" > /opt/xray-agent/nginx_static_path
+
+                    echoContent green " ---> 已设置 Docker Nginx 静态文件路径: ${nginxStaticPath}"
+                else
+                    echoContent yellow " ---> 使用默认静态文件路径: ${nginxStaticPath}"
+                fi
+            fi
+        elif [[ "${hasDockerNginxConfig}" == "true" ]]; then
+            # 有 Docker Nginx 配置但容器未运行（可能暂时停止）
+            echoContent yellow " ---> 检测到之前使用 Docker Nginx，但容器当前未运行"
+            echoContent skyBlue " ---> 提示：Docker Nginx 可能在申请证书时暂时停止"
+            read -r -p "是否继续使用 Docker Nginx 配置？[y/n] (默认: y):" continueDockerNginx
+            if [[ -z "${continueDockerNginx}" ]] || [[ "${continueDockerNginx}" == "y" ]]; then
+                echoContent green " ---> 继续使用 Docker Nginx 配置"
+                nginxConfigPath="${savedNginxPath}"
+                if [[ -f "/opt/xray-agent/nginx_static_path" ]]; then
+                    nginxStaticPath=$(cat /opt/xray-agent/nginx_static_path)
+                    echoContent green " ---> 使用静态文件路径: ${nginxStaticPath}"
+                fi
+            else
+                echoContent yellow " ---> 用户选择不使用 Docker Nginx"
+                # 询问是否安装系统 Nginx
+                read -r -p "是否安装系统级 Nginx？[y/n]:" installSystemNginx
+                if [[ "${installSystemNginx}" == "y" ]]; then
+                    echoContent green " ---> 安装nginx"
+                    installNginxTools
+                    # 清除 Docker Nginx 配置记录
+                    rm -f /opt/xray-agent/nginx_config_path
+                    rm -f /opt/xray-agent/nginx_static_path
+                else
+                    echoContent red " ---> 未安装 Nginx，部分功能可能无法使用"
+                    echoContent yellow " ---> 请手动安装 Nginx 或启动 Docker Nginx 容器后重新运行脚本"
+                fi
+            fi
+        elif ! find /usr/bin /usr/sbin | grep -q -w nginx; then
+            # 没有系统 Nginx，也没有 Docker Nginx 配置
+            echoContent yellow " ---> 未检测到 Nginx (系统或 Docker)"
+            echoContent skyBlue " ---> 提示：如果您使用 Docker Nginx，请确保容器名包含 'nginx' 并处于运行状态"
+            echo ""
+            echoContent yellow "请选择 Nginx 部署方式："
+            echoContent white "1. 安装系统级 Nginx (推荐新手)"
+            echoContent white "2. 使用 Docker Nginx (需要手动启动容器)"
+            echoContent white "3. 跳过 Nginx 安装 (稍后手动配置)"
+            read -r -p "请选择 [1-3] (默认: 1):" nginxChoice
+
+            case "${nginxChoice}" in
+                2)
+                    echoContent green " ---> 选择使用 Docker Nginx"
+                    echoContent yellow "请输入 Docker Nginx 配置目录路径 (例: /opt/nginx/conf.d/):"
+                    read -r -p "配置路径:" dockerNginxPath
+                    if [[ -n "${dockerNginxPath}" ]]; then
+                        if [[ "${dockerNginxPath}" != */ ]]; then
+                            dockerNginxPath="${dockerNginxPath}/"
+                        fi
+                        nginxConfigPath="${dockerNginxPath}"
+                        mkdir -p /opt/xray-agent
+                        echo "${nginxConfigPath}" > /opt/xray-agent/nginx_config_path
+                        echoContent green " ---> 已设置 Docker Nginx 配置路径: ${nginxConfigPath}"
+
+                        echoContent yellow "请输入 Docker Nginx 静态文件目录路径 (例: /opt/nginx/html/):"
+                        read -r -p "静态文件路径:" dockerNginxStaticPath
+                        if [[ -n "${dockerNginxStaticPath}" ]]; then
+                            if [[ "${dockerNginxStaticPath}" != */ ]]; then
+                                dockerNginxStaticPath="${dockerNginxStaticPath}/"
+                            fi
+                            nginxStaticPath="${dockerNginxStaticPath}"
+                            echo "${nginxStaticPath}" > /opt/xray-agent/nginx_static_path
+                            echoContent green " ---> 已设置 Docker Nginx 静态文件路径: ${nginxStaticPath}"
+                        fi
+                    else
+                        echoContent red " ---> 未设置配置路径，退出安装"
+                        exit 0
+                    fi
+                    ;;
+                3)
+                    echoContent yellow " ---> 跳过 Nginx 安装"
+                    echoContent red " ---> 警告：部分功能可能无法使用，请稍后手动配置 Nginx"
+                    ;;
+                *)
+                    echoContent green " ---> 安装系统级 Nginx"
+                    installNginxTools
+                    ;;
+            esac
         else
             # 检测现有 Nginx 业务
             local existingConfCount=$(find /etc/nginx/conf.d /etc/nginx/sites-enabled -name "*.conf" 2>/dev/null | wc -l)
@@ -1328,20 +1550,30 @@ installTools() {
     if [[ "${selectCustomInstallType}" == "7" ]]; then
         echoContent green " ---> 检测到无需依赖证书的服务，跳过安装"
     else
-        if [[ ! -d "$HOME/.acme.sh" ]] || [[ -d "$HOME/.acme.sh" && -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
-            echoContent green " ---> 安装acme.sh"
-            curl -s https://get.acme.sh | sh >/opt/xray-agent/tls/acme.log 2>&1
+        # 检查是否使用 native ACME
+        local useNativeACME=$(useNativeACMECert)
+        
+        if [[ "${nativeACMEEnabled}" != "true" ]]; then
+            # 未使用 native ACME，安装 acme.sh
+            if [[ ! -d "$HOME/.acme.sh" ]] || [[ -d "$HOME/.acme.sh" && -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
+                echoContent green " ---> 安装acme.sh"
+                curl -s https://get.acme.sh | sh >/opt/xray-agent/tls/acme.log 2>&1
 
-            if [[ ! -d "$HOME/.acme.sh" ]] || [[ -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
-                echoContent red "  acme安装失败--->"
-                tail -n 100 /opt/xray-agent/tls/acme.log
-                echoContent yellow "错误排查:"
-                echoContent red "  1.获取Github文件失败，请等待Github恢复后尝试，恢复进度可查看 [https://www.githubstatus.com/]"
-                echoContent red "  2.acme.sh脚本出现bug，可查看[https://github.com/acmesh-official/acme.sh] issues"
-                echoContent red "  3.如纯IPv6机器，请设置NAT64,可执行下方命令，如果添加下方命令还是不可用，请尝试更换其他NAT64"
-                echoContent skyBlue "  sed -i \"1i\\\nameserver 2a00:1098:2b::1\\\nnameserver 2a00:1098:2c::1\\\nnameserver 2a01:4f8:c2c:123f::1\\\nnameserver 2a01:4f9:c010:3f02::1\" /etc/resolv.conf"
-                exit 0
+                if [[ ! -d "$HOME/.acme.sh" ]] || [[ -z $(find "$HOME/.acme.sh/acme.sh") ]]; then
+                    echoContent red "  acme安装失败--->"
+                    tail -n 100 /opt/xray-agent/tls/acme.log
+                    echoContent yellow "错误排查:"
+                    echoContent red "  1.获取Github文件失败，请等待Github恢复后尝试，恢复进度可查看 [https://www.githubstatus.com/]"
+                    echoContent red "  2.acme.sh脚本出现bug，可查看[https://github.com/acmesh-official/acme.sh] issues"
+                    echoContent red "  3.如纯IPv6机器，请设置NAT64,可执行下方命令，如果添加下方命令还是不可用，请尝试更换其他NAT64"
+                    echoContent skyBlue "  sed -i \"1i\\\nameserver 2a00:1098:2b::1\\\nnameserver 2a00:1098:2c::1\\\nnameserver 2a01:4f8:c2c:123f::1\\\nnameserver 2a01:4f9:c010:3f02::1\" /etc/resolv.conf"
+                    exit 0
+                fi
+            else
+                echoContent green " ---> acme.sh 已安装"
             fi
+        else
+            echoContent green " ---> 使用 Native ACME 证书，跳过安装 acme.sh"
         fi
     fi
 
@@ -1522,11 +1754,32 @@ server {
     }
 }
 EOF
+        
+        # Docker Nginx 调试信息
+        if [[ -n "${customNginxConfigPath}" ]]; then
+            echoContent yellow " ---> Docker Nginx 模式"
+            echoContent skyBlue " ---> 配置文件: ${nginxConfigPath}checkPortOpen.conf"
+            if [[ -f "${nginxConfigPath}checkPortOpen.conf" ]]; then
+                echoContent green " ---> 配置文件创建成功"
+            else
+                echoContent red " ---> 配置文件创建失败"
+            fi
+        fi
+        
         handleNginx start
         # 检查域名+端口的开放
         checkPortOpenResult=$(curl -s -m 10 "http://${domain}:${port}/checkPort")
         localIP=$(curl -s -m 10 "http://${domain}:${port}/ip")
         rm "${nginxConfigPath}checkPortOpen.conf"
+        
+        # 如果是 Docker Nginx，删除配置后需要重载
+        if [[ -n "${customNginxConfigPath}" ]]; then
+            local dockerNginxContainer=$(docker ps --filter "name=nginx" --format "{{.Names}}" 2>/dev/null | head -n 1)
+            if [[ -n "${dockerNginxContainer}" ]]; then
+                docker exec "${dockerNginxContainer}" nginx -s reload >/dev/null 2>&1
+            fi
+        fi
+        
         handleNginx stop
         if [[ "${checkPortOpenResult}" == "fjkvymb6len" ]]; then
             echoContent green " ---> 检测到${port}端口已开放"
@@ -1552,7 +1805,21 @@ EOF
 initTLSNginxConfig() {
     handleNginx stop
     echoContent skyBlue "\n进度  $1/${totalProgress} : 初始化Nginx申请证书配置"
-    
+
+    # 优先读取已保存的 Docker Nginx 配置
+    if [[ -f /opt/xray-agent/nginx_config_path ]]; then
+        nginxConfigPath=$(cat /opt/xray-agent/nginx_config_path)
+        customNginxConfigPath="true"
+        echoContent green " ---> 使用已保存的 Docker Nginx 配置路径: ${nginxConfigPath}"
+
+        # 读取已保存的静态文件路径
+        if [[ -f "/opt/xray-agent/nginx_static_path" ]]; then
+            nginxStaticPath=$(cat /opt/xray-agent/nginx_static_path)
+            echoContent green " ---> 使用已保存的静态文件路径: ${nginxStaticPath}"
+        fi
+        return
+    fi
+
     # 询问是否自定义 Nginx 配置路径
     if [[ -z "${customNginxConfigPath}" ]]; then
         echoContent skyBlue "\n=============================================================="
@@ -1572,6 +1839,11 @@ initTLSNginxConfig() {
                 if [[ -d "${inputNginxPath}" ]]; then
                     nginxConfigPath="${inputNginxPath}"
                     customNginxConfigPath="true"
+                    
+                    # 保存配置路径到文件
+                    mkdir -p /opt/xray-agent
+                    echo "${nginxConfigPath}" > /opt/xray-agent/nginx_config_path
+                    
                     echoContent green "\n ---> 已设置 Nginx 配置路径: ${nginxConfigPath}"
                 else
                     echoContent yellow "\n路径不存在，是否创建？[y/n]:"
@@ -1580,6 +1852,11 @@ initTLSNginxConfig() {
                         mkdir -p "${inputNginxPath}"
                         nginxConfigPath="${inputNginxPath}"
                         customNginxConfigPath="true"
+                        
+                        # 保存配置路径到文件
+                        mkdir -p /opt/xray-agent
+                        echo "${nginxConfigPath}" > /opt/xray-agent/nginx_config_path
+                        
                         echoContent green "\n ---> 已创建并设置 Nginx 配置路径: ${nginxConfigPath}"
                     else
                         echoContent yellow "\n ---> 使用默认路径: ${nginxConfigPath}"
@@ -1588,6 +1865,35 @@ initTLSNginxConfig() {
             fi
         else
             echoContent green "\n ---> 使用默认路径: ${nginxConfigPath}"
+        fi
+        
+        # 如果是自定义路径（Docker Nginx），询问静态文件路径
+        if [[ -n "${customNginxConfigPath}" ]]; then
+            echoContent skyBlue "\n=============================================================="
+            echoContent yellow "检测到的 Nginx 静态文件路径: ${nginxStaticPath}"
+            echoContent skyBlue "==============================================================\n"
+            read -r -p "是否使用自定义 Nginx 静态文件路径？[y/n] (默认: n):" useCustomStaticPath
+            if [[ "${useCustomStaticPath}" == "y" ]]; then
+                echoContent yellow "请输入 Nginx 静态文件目录路径 (容器内路径，例: /var/www/):"
+                read -r -p "静态文件路径:" inputNginxStaticPath
+                if [[ -n "${inputNginxStaticPath}" ]]; then
+                    # 确保路径以 / 结尾
+                    if [[ "${inputNginxStaticPath}" != */ ]]; then
+                        inputNginxStaticPath="${inputNginxStaticPath}/"
+                    fi
+                    nginxStaticPath="${inputNginxStaticPath}"
+                    
+                    # 保存静态文件路径到文件
+                    mkdir -p /opt/xray-agent
+                    echo "${nginxStaticPath}" > /opt/xray-agent/nginx_static_path
+                    
+                    echoContent green "\n ---> 已设置 Nginx 静态文件路径: ${nginxStaticPath}"
+                else
+                    echoContent yellow "\n ---> 使用默认静态文件路径: ${nginxStaticPath}"
+                fi
+            else
+                echoContent green "\n ---> 使用默认静态文件路径: ${nginxStaticPath}"
+            fi
         fi
     fi
     
@@ -1907,7 +2213,46 @@ customSSLEmail() {
 }
 # DNS API申请证书
 switchDNSAPI() {
-    read -r -p "是否使用DNS API申请证书[支持NAT]？[y/n]:" dnsAPIStatus
+    # 检测是否有 Native ACME，提供使用现有证书的选项
+    if checkNativeACME; then
+        echoContent skyBlue "\n=============================================================="
+        echoContent yellow "检测到系统已安装 Native ACME 客户端"
+        echoContent skyBlue "==============================================================\n"
+        echoContent yellow "请选择证书获取方式:"
+        echoContent yellow "1. 使用现有 Native ACME 证书 (推荐)"
+        echoContent yellow "2. 使用 acme.sh 申请新证书 (DNS API)"
+        echoContent yellow "3. 使用 acme.sh 申请新证书 (standalone)\n"
+        read -r -p "请选择 [1-3, 默认: 1]:" certMethodChoice
+        
+        case ${certMethodChoice} in
+        1 | "")
+            # 使用 Native ACME 现有证书
+            echoContent green "\n ---> 选择使用 Native ACME 证书"
+            provideExistingCert
+            return
+            ;;
+        2)
+            # 使用 acme.sh DNS API 申请
+            echoContent green "\n ---> 选择使用 acme.sh DNS API 申请证书"
+            dnsAPIStatus="y"
+            ;;
+        3)
+            # 使用 acme.sh standalone 申请
+            echoContent green "\n ---> 选择使用 acme.sh standalone 申请证书"
+            dnsAPIStatus="n"
+            return
+            ;;
+        *)
+            echoContent red "\n ---> 选择无效，默认使用 Native ACME 证书"
+            provideExistingCert
+            return
+            ;;
+        esac
+    else
+        # 没有 Native ACME，询问是否使用 DNS API
+        read -r -p "是否使用DNS API申请证书[支持NAT]？[y/n]:" dnsAPIStatus
+    fi
+    
     if [[ "${dnsAPIStatus}" == "y" ]]; then
         echoContent red "\n=============================================================="
         echoContent yellow "1.cloudflare[默认]"
@@ -1926,6 +2271,312 @@ switchDNSAPI() {
             ;;
         esac
         initDNSAPIConfig "${dnsAPIType}"
+    fi
+}
+
+# 提供现有证书（简化版）
+provideExistingCert() {
+    echoContent skyBlue "\n请选择证书来源:"
+    echoContent yellow "1. 使用现有证书（从列表选择）- 支持 certbot 和 acme.sh"
+    echoContent yellow "2. 手动指定证书路径"
+    echoContent yellow "3. 使用通配符证书路径"
+    echoContent yellow "4. 使用 certbot 申请新证书\n"
+    read -r -p "请选择 [1-4, 默认: 1]:" certSourceType
+    
+    case ${certSourceType:-1} in
+    1)
+        # 使用现有证书 - 支持 certbot 和 acme.sh
+        local certbotCerts=()
+        local acmeshCerts=()
+
+        # 检查 certbot 证书
+        if [[ -d "/etc/letsencrypt/live" ]]; then
+            while IFS= read -r cert; do
+                certbotCerts+=("${cert}")
+            done < <(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+        fi
+
+        # 检查 acme.sh 证书
+        if [[ -d "$HOME/.acme.sh" ]]; then
+            while IFS= read -r certDir; do
+                # 获取域名（移除_ecc后缀）
+                certName=$(basename "${certDir}")
+                certName=${certName%_ecc}
+                # 检查证书文件是否存在
+                if [[ -f "$HOME/.acme.sh/${certName}_ecc/${certName}.cer" ]] && [[ -f "$HOME/.acme.sh/${certName}_ecc/${certName}.key" ]]; then
+                    acmeshCerts+=("${certName}")
+                fi
+            done < <(find "$HOME/.acme.sh" -maxdepth 1 -type d -name "*_ecc" 2>/dev/null)
+        fi
+
+        # 合并并去重
+        local allCerts=($(printf '%s\n' "${certbotCerts[@]}" "${acmeshCerts[@]}" | sort -u))
+
+        if [[ ${#allCerts[@]} -eq 0 ]]; then
+            echoContent red "\n ---> 未找到任何证书"
+            nativeACMEEnabled=false
+        else
+            echoContent green "\n可用证书域名 (certbot 和 acme.sh):"
+            for i in "${!allCerts[@]}"; do
+                local cert="${allCerts[$i]}"
+                local source="certbot"
+                # 判断证书来源
+                if [[ " ${acmeshCerts[*]} " =~ " ${cert} " ]]; then
+                    source="acme.sh"
+                fi
+                echo "$((i + 1)). ${cert} (${source})"
+            done
+
+            read -r -p "请输入证书序号 或 域名:" selectedDomain
+
+            # 处理数字输入
+            if [[ "${selectedDomain}" =~ ^[0-9]+$ ]] && [[ ${selectedDomain} -le ${#allCerts[@]} ]]; then
+                selectedDomain="${allCerts[$((selectedDomain - 1))]}"
+            fi
+
+            # 尝试从 certbot 获取
+            if [[ -d "/etc/letsencrypt/live/${selectedDomain}" ]]; then
+                nativeCertPath="/etc/letsencrypt/live/${selectedDomain}/fullchain.pem"
+                nativeKeyPath="/etc/letsencrypt/live/${selectedDomain}/privkey.pem"
+
+                if [[ -f "${nativeCertPath}" && -f "${nativeKeyPath}" ]]; then
+                    domain=${selectedDomain}
+                    nativeACMEEnabled=true
+                    echoContent green "\n ---> 证书来源: certbot"
+                    echoContent green " ---> 证书路径: ${nativeCertPath}"
+                    echoContent green " ---> 密钥路径: ${nativeKeyPath}"
+                else
+                    echoContent red "\n ---> 证书文件不存在"
+                    nativeACMEEnabled=false
+                fi
+            # 尝试从 acme.sh 获取
+            elif [[ -f "$HOME/.acme.sh/${selectedDomain}_ecc/${selectedDomain}.cer" ]] && [[ -f "$HOME/.acme.sh/${selectedDomain}_ecc/${selectedDomain}.key" ]]; then
+                nativeCertPath="$HOME/.acme.sh/${selectedDomain}_ecc/${selectedDomain}.cer"
+                nativeKeyPath="$HOME/.acme.sh/${selectedDomain}_ecc/${selectedDomain}.key"
+                domain=${selectedDomain}
+                nativeACMEEnabled=true
+                echoContent green "\n ---> 证书来源: acme.sh"
+                echoContent green " ---> 证书路径: ${nativeCertPath}"
+                echoContent green " ---> 密钥路径: ${nativeKeyPath}"
+            else
+                echoContent red "\n ---> 域名不存在或证书文件不存在"
+                nativeACMEEnabled=false
+            fi
+        fi
+        ;;
+    2)
+        # 手动指定证书路径
+        echoContent yellow "\n请输入证书完整路径 (fullchain.pem):"
+        read -r -p "证书路径:" inputCertPath
+        echoContent yellow "请输入私钥完整路径 (privkey.pem):"
+        read -r -p "私钥路径:" inputKeyPath
+        
+        if [[ -f "${inputCertPath}" && -f "${inputKeyPath}" ]]; then
+            nativeCertPath="${inputCertPath}"
+            nativeKeyPath="${inputKeyPath}"
+            nativeACMEEnabled=true
+            
+            # 尝试从证书中提取域名
+            domain=$(openssl x509 -in "${nativeCertPath}" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^,]+' | head -1)
+            if [[ -z "${domain}" ]]; then
+                echoContent yellow "\n无法从证书提取域名，请手动输入:"
+                read -r -p "域名:" domain
+            fi
+            
+            echoContent green "\n ---> 使用证书: ${nativeCertPath}"
+            echoContent green " ---> 使用密钥: ${nativeKeyPath}"
+            echoContent green " ---> 域名: ${domain}"
+        else
+            echoContent red "\n ---> 证书或密钥文件不存在"
+            nativeACMEEnabled=false
+        fi
+        ;;
+    3)
+        # 使用通配符证书
+        echoContent yellow "\n请输入通配符证书的主域名 (例: example.com):"
+        read -r -p "主域名:" wildcardDomain
+        
+        # 默认 Let's Encrypt 通配符证书路径
+        local wildcardCertPath="/etc/letsencrypt/live/${wildcardDomain}/fullchain.pem"
+        local wildcardKeyPath="/etc/letsencrypt/live/${wildcardDomain}/privkey.pem"
+        
+        # 如果默认路径不存在，询问自定义路径
+        if [[ ! -f "${wildcardCertPath}" ]]; then
+            echoContent yellow "\n默认路径不存在，是否指定自定义路径？[y/n]:"
+            read -r -p "" customWildcardPath
+            
+            if [[ "${customWildcardPath}" == "y" ]]; then
+                echoContent yellow "请输入通配符证书路径:"
+                read -r -p "证书路径:" wildcardCertPath
+                echoContent yellow "请输入通配符私钥路径:"
+                read -r -p "私钥路径:" wildcardKeyPath
+            fi
+        fi
+        
+        if [[ -f "${wildcardCertPath}" && -f "${wildcardKeyPath}" ]]; then
+            nativeCertPath="${wildcardCertPath}"
+            nativeKeyPath="${wildcardKeyPath}"
+            nativeACMEEnabled=true
+            
+            echoContent yellow "\n使用通配符证书，请输入实际使用的子域名 (例: sub.example.com):"
+            read -r -p "域名:" domain
+            
+            echoContent green "\n ---> 通配符证书: ${nativeCertPath}"
+            echoContent green " ---> 通配符密钥: ${nativeKeyPath}"
+            echoContent green " ---> 应用域名: ${domain}"
+        else
+            echoContent red "\n ---> 通配符证书不存在"
+            nativeACMEEnabled=false
+        fi
+        ;;
+    4)
+        # 使用 certbot 申请新证书
+        if ! command -v certbot &> /dev/null; then
+            echoContent red "\n ---> certbot 未安装"
+            echoContent yellow " ---> 正在安装 certbot..."
+            
+            if [[ "${release}" == "ubuntu" ]] || [[ "${release}" == "debian" ]]; then
+                ${installType} certbot >/dev/null 2>&1
+            elif [[ "${release}" == "centos" ]]; then
+                ${installType} certbot >/dev/null 2>&1
+            fi
+            
+            if ! command -v certbot &> /dev/null; then
+                echoContent red " ---> certbot 安装失败，将使用 acme.sh"
+                nativeACMEEnabled=false
+                return
+            fi
+            echoContent green " ---> certbot 安装成功"
+        fi
+        
+        echoContent yellow "\n请输入域名 (例: example.com):"
+        read -r -p "域名:" certbotDomain
+        
+        if [[ -z "${certbotDomain}" ]]; then
+            echoContent red "\n ---> 域名不能为空"
+            nativeACMEEnabled=false
+            return
+        fi
+        
+        domain=${certbotDomain}
+        
+        echoContent skyBlue "\n请选择证书类型:"
+        echoContent yellow "1. 普通证书 (单域名)"
+        echoContent yellow "2. 通配符证书 (需要 DNS 验证)\n"
+        read -r -p "请选择 [1-2, 默认: 1]:" certbotCertType
+        
+        # 选择 CA 服务器 - 使用原有的 switchSSLType 逻辑
+        switchSSLType
+        
+        local certbotServer=""
+        local certbotEabKid=""
+        local certbotEabHmac=""
+        
+        case ${sslType} in
+        letsencrypt)
+            certbotServer=""  # Let's Encrypt 是默认的
+            ;;
+        zerossl)
+            certbotServer="--server https://acme.zerossl.com/v2/DV90"
+            ;;
+        buypass)
+            certbotServer="--server https://api.buypass.com/acme/directory"
+            ;;
+        google)
+            certbotServer="--server https://dv.acme-v02.api.pki.goog/directory"
+            
+            # 读取保存的 Google EAB 凭证
+            if [[ -f /opt/xray-agent/tls/google_eab_kid ]]; then
+                certbotEabKid=$(cat /opt/xray-agent/tls/google_eab_kid)
+                certbotEabHmac=$(cat /opt/xray-agent/tls/google_eab_hmac)
+                echoContent green "\n ---> 使用已保存的 Google EAB 凭证"
+            fi
+            
+            if [[ -z "${certbotEabKid}" || -z "${certbotEabHmac}" ]]; then
+                echoContent red "\n ---> 未找到 Google EAB 凭证，请先配置"
+                nativeACMEEnabled=false
+                return
+            fi
+            ;;
+        *)
+            certbotServer=""
+            ;;
+        esac
+        
+        echoContent yellow "\n正在使用 certbot 申请证书，请稍候..."
+        
+        local certbotCmd="certbot certonly --non-interactive --agree-tos --email admin@${certbotDomain} ${certbotServer}"
+        
+        # 添加 EAB 参数（如果是 Google GTS）
+        if [[ -n "${certbotEabKid}" && -n "${certbotEabHmac}" ]]; then
+            certbotCmd="${certbotCmd} --eab-kid ${certbotEabKid} --eab-hmac-key ${certbotEabHmac}"
+        fi
+        
+        if [[ "${certbotCertType:-1}" == "2" ]]; then
+            # 通配符证书 - 需要 DNS 验证
+            echoContent yellow "\n通配符证书需要 DNS 验证"
+            echoContent yellow "支持的 DNS 插件:"
+            echoContent yellow "1. Cloudflare"
+            echoContent yellow "2. 手动 DNS (需要手动添加 TXT 记录)\n"
+            read -r -p "请选择 [1-2, 默认: 2]:" dnsPlugin
+            
+            if [[ "${dnsPlugin}" == "1" ]]; then
+                # 检查 Cloudflare 插件
+                if ! dpkg -l 2>/dev/null | grep -q python3-certbot-dns-cloudflare; then
+                    echoContent yellow " ---> 安装 Cloudflare DNS 插件..."
+                    ${installType} python3-certbot-dns-cloudflare >/dev/null 2>&1
+                fi
+                
+                echoContent yellow "\n请输入 Cloudflare API Token:"
+                read -r -p "API Token:" cfToken
+                
+                # 创建 Cloudflare 配置文件
+                mkdir -p /root/.secrets
+                echo "dns_cloudflare_api_token = ${cfToken}" > /root/.secrets/cloudflare.ini
+                chmod 600 /root/.secrets/cloudflare.ini
+                
+                certbotCmd="${certbotCmd} --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini -d *.${certbotDomain} -d ${certbotDomain}"
+            else
+                # 手动 DNS
+                certbotCmd="${certbotCmd} --manual --preferred-challenges dns -d *.${certbotDomain} -d ${certbotDomain}"
+            fi
+        else
+            # 普通证书 - standalone
+            certbotCmd="${certbotCmd} --standalone -d ${certbotDomain}"
+        fi
+        
+        echoContent skyBlue "\n执行命令: ${certbotCmd}\n"
+        
+        if eval "${certbotCmd}"; then
+            nativeCertPath="/etc/letsencrypt/live/${certbotDomain}/fullchain.pem"
+            nativeKeyPath="/etc/letsencrypt/live/${certbotDomain}/privkey.pem"
+            
+            if [[ -f "${nativeCertPath}" && -f "${nativeKeyPath}" ]]; then
+                nativeACMEEnabled=true
+                echoContent green "\n ---> 证书申请成功"
+                echoContent green " ---> 证书路径: ${nativeCertPath}"
+                echoContent green " ---> 密钥路径: ${nativeKeyPath}"
+            else
+                echoContent red "\n ---> 证书文件未找到"
+                nativeACMEEnabled=false
+            fi
+        else
+            echoContent red "\n ---> 证书申请失败"
+            nativeACMEEnabled=false
+        fi
+        ;;
+    *)
+        echoContent red "\n ---> 选择无效"
+        nativeACMEEnabled=false
+        ;;
+    esac
+    
+    # 如果成功配置 native 证书，创建软链接
+    if [[ "${nativeACMEEnabled}" == "true" && -n "${nativeCertPath}" && -n "${nativeKeyPath}" ]]; then
+        mkdir -p /opt/xray-agent/tls
+        ln -sf "${nativeCertPath}" "/opt/xray-agent/tls/${domain}.crt"
+        ln -sf "${nativeKeyPath}" "/opt/xray-agent/tls/${domain}.key"
+        echoContent green "\n ---> 已创建证书软链接到 /opt/xray-agent/tls/"
     fi
 }
 # 初始化dns配置
@@ -2102,7 +2753,31 @@ acmeInstallSSL() {
         sudo Ali_Key="${aliKey}" Ali_Secret="${aliSecret}" "$HOME/.acme.sh/acme.sh" --issue -d "${dnsAPIDomain}" -d "${dnsTLSDomain}" --dns dns_ali -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /opt/xray-agent/tls/acme.log >/dev/null
     else
         echoContent green " ---> 生成证书中"
+        
+        # Standalone 模式需要停止 Nginx 以释放 80 端口
+        if [[ -n "${customNginxConfigPath}" ]]; then
+            # Docker Nginx - 停止容器
+            local dockerNginxContainer=$(docker ps --filter "name=nginx" --format "{{.Names}}" 2>/dev/null | head -n 1)
+            if [[ -n "${dockerNginxContainer}" ]]; then
+                echoContent yellow " ---> 停止 Docker Nginx 容器以释放 80 端口"
+                docker stop "${dockerNginxContainer}" >/dev/null 2>&1
+            fi
+        else
+            # 系统 Nginx
+            handleNginx stop
+        fi
+        
         sudo "$HOME/.acme.sh/acme.sh" --issue -d "${tlsDomain}" --standalone -k ec-256 --server "${sslType}" ${sslIPv6} 2>&1 | tee -a /opt/xray-agent/tls/acme.log >/dev/null
+        
+        # 证书申请完成后重启 Nginx
+        if [[ -n "${customNginxConfigPath}" ]]; then
+            # Docker Nginx - 重启容器
+            local dockerNginxContainer=$(docker ps -a --filter "name=nginx" --format "{{.Names}}" 2>/dev/null | head -n 1)
+            if [[ -n "${dockerNginxContainer}" ]]; then
+                echoContent green " ---> 重启 Docker Nginx 容器"
+                docker start "${dockerNginxContainer}" >/dev/null 2>&1
+            fi
+        fi
     fi
 }
 # 自定义端口
@@ -2187,6 +2862,23 @@ checkPort() {
 # 安装TLS
 installTLS() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 申请TLS证书\n"
+    
+    # 检查是否使用 Native ACME 证书
+    if [[ "${nativeACMEEnabled}" == "true" ]]; then
+        echoContent green " ---> 使用 Native ACME 证书"
+        echoContent green " ---> 证书路径: ${nativeCertPath}"
+        echoContent green " ---> 密钥路径: ${nativeKeyPath}"
+        
+        # 验证证书文件存在
+        if [[ -f "/opt/xray-agent/tls/${domain}.crt" && -f "/opt/xray-agent/tls/${domain}.key" ]]; then
+            echoContent green " ---> Native ACME 证书已就绪"
+            return 0
+        else
+            echoContent red " ---> Native ACME 证书软链接创建失败"
+            exit 0
+        fi
+    fi
+    
     readAcmeTLS
     local tlsDomain=${domain}
 
@@ -2197,9 +2889,9 @@ installTLS() {
 
         if [[ -z $(find /opt/xray-agent/tls/ -name "${tlsDomain}.crt") ]] || [[ -z $(find /opt/xray-agent/tls/ -name "${tlsDomain}.key") ]] || [[ -z $(cat "/opt/xray-agent/tls/${tlsDomain}.crt") ]]; then
             if [[ "${installedDNSAPIStatus}" == "true" ]]; then
-                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchainpath "/opt/xray-agent/tls/${tlsDomain}.crt" --keypath "/opt/xray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
+                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "*.${dnsTLSDomain}" --fullchain-file "/opt/xray-agent/tls/${tlsDomain}.crt" --key-file "/opt/xray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
             else
-                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchainpath "/opt/xray-agent/tls/${tlsDomain}.crt" --keypath "/opt/xray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
+                sudo "$HOME/.acme.sh/acme.sh" --installcert -d "${tlsDomain}" --fullchain-file "/opt/xray-agent/tls/${tlsDomain}.crt" --key-file "/opt/xray-agent/tls/${tlsDomain}.key" --ecc >/dev/null
             fi
 
         else
@@ -2240,15 +2932,16 @@ installTLS() {
                 exit 0
             fi
 
-            installTLSCount=1
             echo
 
             if tail -n 10 /opt/xray-agent/tls/acme.log | grep -q "Could not validate email address as valid"; then
                 echoContent red " ---> 邮箱无法通过SSL厂商验证，请重新输入"
                 echo
                 customSSLEmail "validate email"
+                installTLSCount=1
                 installTLS "$1"
             else
+                installTLSCount=1
                 installTLS "$1"
             fi
         fi
@@ -2392,7 +3085,86 @@ updateSELinuxHTTPPortT() {
 
 # 操作Nginx
 handleNginx() {
-
+    # 检查是否使用 Docker Nginx
+    if [[ -n "${customNginxConfigPath}" ]]; then
+        # Docker Nginx 处理
+        local dockerNginxContainer=$(docker ps -a --filter "name=nginx" --format "{{.Names}}" 2>/dev/null | head -n 1)
+        
+        if [[ -z "${dockerNginxContainer}" ]]; then
+            echoContent yellow " ---> 未找到 Docker Nginx 容器"
+            return
+        fi
+        
+        # 检查容器状态
+        local containerStatus=$(docker inspect --format='{{.State.Status}}' "${dockerNginxContainer}" 2>/dev/null)
+        
+        if [[ "$1" == "start" ]]; then
+            # 如果容器正在重启，等待恢复
+            if [[ "${containerStatus}" == "restarting" ]]; then
+                echoContent yellow " ---> Docker Nginx 正在重启，等待恢复..."
+                
+                # 循环等待最多30秒，每2秒检查一次
+                local waitCount=0
+                local maxWait=15  # 最多等待15次 * 2秒 = 30秒
+                
+                while [[ "${containerStatus}" == "restarting" && ${waitCount} -lt ${maxWait} ]]; do
+                    sleep 2
+                    containerStatus=$(docker inspect --format='{{.State.Status}}' "${dockerNginxContainer}" 2>/dev/null)
+                    waitCount=$((waitCount + 1))
+                    
+                    if [[ ${waitCount} -eq 5 ]]; then
+                        echoContent yellow " ---> 仍在重启中，继续等待..."
+                    elif [[ ${waitCount} -eq 10 ]]; then
+                        echoContent yellow " ---> 等待时间较长，请检查容器日志..."
+                    fi
+                done
+                
+                # 检查是否超时
+                if [[ "${containerStatus}" == "restarting" ]]; then
+                    echoContent red " ---> Docker Nginx 重启超时（30秒）"
+                    echoContent yellow " ---> 请查看容器日志: docker logs nginx"
+                    return 1
+                fi
+                
+                echoContent green " ---> Docker Nginx 已恢复到 ${containerStatus} 状态"
+            fi
+            
+            # 如果容器停止，启动它
+            if [[ "${containerStatus}" != "running" ]]; then
+                echoContent yellow " ---> 启动 Docker Nginx 容器"
+                docker start "${dockerNginxContainer}" >/dev/null 2>&1
+                sleep 3
+                
+                # 再次检查状态
+                containerStatus=$(docker inspect --format='{{.State.Status}}' "${dockerNginxContainer}" 2>/dev/null)
+                if [[ "${containerStatus}" != "running" ]]; then
+                    echoContent red " ---> Docker Nginx 启动失败，当前状态: ${containerStatus}"
+                    echoContent yellow " ---> 请查看容器日志: docker logs nginx"
+                    return 1
+                fi
+            fi
+            
+            # 测试配置文件
+            if ! docker exec "${dockerNginxContainer}" nginx -t 2>&1 | tee /tmp/nginx_test.log; then
+                echoContent red " ---> Docker Nginx 配置测试失败"
+                echoContent red " ---> 错误信息："
+                cat /tmp/nginx_test.log
+                return 1
+            fi
+            
+            # 重载配置
+            docker exec "${dockerNginxContainer}" nginx -s reload >/dev/null 2>&1
+            sleep 0.5
+            echoContent green " ---> Docker Nginx 配置重载成功"
+            
+        elif [[ "$1" == "stop" ]]; then
+            # Docker Nginx 不需要停止，只需要移除临时配置
+            echoContent green " ---> Docker Nginx 保持运行"
+        fi
+        return
+    fi
+    
+    # 原有的系统 Nginx 处理逻辑
     if ! echo "${selectCustomInstallType}" | grep -qwE ",7,|,8,|,7,8," && [[ -z $(pgrep -f "nginx") ]] && [[ "$1" == "start" ]]; then
         if [[ "${release}" == "alpine" ]]; then
             rc-service nginx start 2>/opt/xray-agent/nginx_error.log
@@ -5697,6 +6469,13 @@ showAccounts() {
 }
 # 移除nginx302配置
 removeNginx302() {
+    # 检查配置文件是否存在
+    if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
+        echoContent red " ---> 配置文件不存在: ${nginxConfigPath}xray-agent.conf"
+        echoContent yellow " ---> 请先完成 Xray 安装后再使用此功能"
+        return 1
+    fi
+    
     # 使用临时文件避免在循环中修改原文件
     local tmpFile="${nginxConfigPath}xray-agent.conf.tmp"
     cp "${nginxConfigPath}xray-agent.conf" "${tmpFile}"
@@ -5727,6 +6506,11 @@ checkNginx302() {
 # 备份恢复nginx文件
 backupNginxConfig() {
     if [[ "$1" == "backup" ]]; then
+        if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
+            echoContent red " ---> 配置文件不存在: ${nginxConfigPath}xray-agent.conf"
+            echoContent yellow " ---> 请先完成 Xray 安装后再使用此功能"
+            return 1
+        fi
         cp ${nginxConfigPath}xray-agent.conf /opt/xray-agent/xray-agent_backup.conf
         echoContent green " ---> nginx配置文件备份成功"
     fi
@@ -5742,6 +6526,14 @@ backupNginxConfig() {
 addNginx302() {
     local redirectUrl="$1"
     local redirectCode="${2:-302}"  # 默认 302
+    
+    # 检查配置文件是否存在
+    if [[ ! -f "${nginxConfigPath}xray-agent.conf" ]]; then
+        echoContent red " ---> 配置文件不存在: ${nginxConfigPath}xray-agent.conf"
+        echoContent yellow " ---> 请先完成 Xray 安装后再使用此功能"
+        backupNginxConfig restoreBackup
+        return 1
+    fi
     
     # 验证 URL 格式
     if [[ ! "${redirectUrl}" =~ ^https?:// ]]; then
